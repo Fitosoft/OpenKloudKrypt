@@ -31,6 +31,7 @@
         <module>filewatcher</module>
         <module>core</module>
         <module>osintegration</module>
+        <module>persistence</module>
     </modules>
 
     <dependencies>
