@@ -1,0 +1,276 @@
+GitHub Copilot Chat Assistant
+
+Project goals & threat model (to be stated in project wiki)
+- Threat model (explicit): active remote attacker (cloud provider or network attacker) who can read, modify, and replay files stored in the cloud. Local device is assumed trusted for private key storage but not the cloud. The system must provide confidentiality and integrity for file content and authenticated metadata. It does not hide file sizes and some timing information unless specifically enabled.
+- Primary security goals: confidentiality, integrity, authenticated metadata, safe multi-user symmetric-key sharing (hybrid encryption), robust two-way sync with conflict handling and atomic operations.
+- Secondary goals: usability on Windows, maintainable code on JVM/Scala, secure key lifecycle (onboarding, rotation, revocation), clear documentation.
+
+High-level technology choices (recommended)
+- JVM: target Java 17 (LTS). Optionally Java 21 if you want the newest features; choose one LTS and standardize across CI.
+- Language: keep Scala code base. Continue using Scala + JVM libs.
+- Build tool: Gradle (Kotlin DSL) with wrapper. Multi-module build.
+- Crypto library (recommended order):
+  1. Google Tink (Java) — safe-by-default, AEAD and hybrid support, fewer footguns.
+  2. Bouncy Castle (modern) — if you need explicit control (X25519, XChaCha20-Poly1305). Use the latest BC provider.
+  3. libsodium (native) only if performance/primitive set demands it (extra packaging work).
+- Use SecureRandom, Argon2id for passphrase KDF (if available via library), else PBKDF2 as fallback with clear doc of tradeoffs.
+
+Top priority fixes (must do immediately)
+1. Replace AES/CBC with AEAD:
+   - Use AES-GCM (12-byte nonce, 128-bit tag) or XChaCha20-Poly1305 (24-byte nonce).
+   - NEVER use a fixed or zero IV/nonce. Generate a fresh random nonce per encryption.
+   - Protect metadata with AEAD as well (same key or a derived key).
+2. Implement per-file symmetric keys:
+   - Generate a random per-file key (AES-256 or ChaCha20 key).
+   - Encrypt the file content using AEAD with per-file key + nonce.
+   - Do not encrypt large files with RSA — use hybrid approach.
+3. Key wrapping for multi-user:
+   - For each authorized recipient, wrap the per-file symmetric key:
+     - Preferred: Ephemeral X25519 ECDH + HKDF → AEAD wrap (forward-secure, compact keys).
+     - Backwards-compatible fallback: RSA-OAEP(SHA-256) for wrapping small keys.
+   - Store wrapped keys for recipients in authenticated metadata in the file header.
+4. Metadata must be authenticated:
+   - Metadata includes fileId, originalName, ownerId, recipients (id + wrappedKey), version, timestamp, contentHash.
+   - Encrypt and authenticate metadata via AEAD using the per-file key (or a derived metadata-key).
+5. Stop storing/exposing private keys in code or logs:
+   - Do not keep Base64(privateKey) in global vals or resource files.
+   - Move private keys into OS-provided secure storage (see Windows section).
+6. Replace AesCrypto implementation:
+   - Remove static IV and AES/CBC usage.
+   - Implement AEAD (preferably via Tink) and return/throw errors properly (no nulls, no printing secret info).
+
+Detailed file format (implement and document)
+- Use a versioned binary header. Example format to implement and document exactly in README/wiki:
+  - 4 bytes: MAGIC = "OKK2" (ASCII)
+  - 1 byte: VERSION = 0x01
+  - 1 byte: FLAGS
+  - 1 byte: NONCE_LEN (e.g., 12 for AES-GCM, 24 for XChaCha20)
+  - NONCE (NONCE_LEN bytes)
+  - 4 bytes: META_LEN (big-endian)
+  - META (META_LEN bytes) — META is the AEAD-encrypted and authenticated JSON/CBOR metadata (see schema below)
+  - CIPHERTEXT (remaining bytes) — AEAD ciphertext for file content including auth tag (if provider appends)
+- Metadata schema (JSON or CBOR):
+  - fileId (UUID)
+  - originalFilename
+  - ownerId (user identifier)
+  - version (integer or content hash)
+  - timestamp (ISO8601)
+  - recipients: [{ recipientId, alg, wrappedKeyB64 }]
+  - contentHash (SHA-256, hex/base64)
+  - optional: flags, file-size-padded info
+- All metadata must be AEAD-authenticated. If metadata is tampered, decryption must fail.
+
+Filename masking policy (choose and implement one; document tradeoffs)
+- Option A (stateless, simpler): Deterministic HMAC mask
+  - maskedName = base32(HMAC-SHA256(nameKey, originalPath)) + extension
+  - Pros: stateless, stable mapping. Cons: leaks equality (same plaintext path → same masked name).
+- Option B (recommended for better privacy): Randomized masked names + embedded original name in metadata
+  - Generate random filename tokens (e.g., 16-20 bytes Base32). Store original filename in encrypted metadata.
+  - Pros: hides equality and original names. Cons: requires reading metadata for listing; more complex.
+- For Windows: use Base32 or Base64url (no padding "=") and sanitize to avoid reserved chars. Keep names < 200 chars to avoid typical path-length issues.
+
+KDF / passphrase handling
+- If supporting passphrases, use Argon2id with parameters tuned for Windows desktop:
+  - Example: memory = 64MB, iterations = 3, parallelism = 1 (tune based on performance testing).
+  - Store salt (random, 16 bytes) and Argon2 parameters in user metadata.
+- If Argon2 cannot be adopted, use PBKDF2WithHmacSHA256 with a large iteration count (e.g., >= 200k depending on perf) and random salt.
+- Do not use username as salt.
+
+Private key management (Windows specifics)
+- Store private keys in Windows-provided stores:
+  - Use DPAPI (CryptProtectData/CryptUnprotectData) via JNA, or use Java's SunMSCAPI provider to access the Windows-MY / Windows-ROOT keystore.
+  - Option: use Windows Credential Manager or CNG APIs (via existing Java libs).
+- Never store unencrypted private key files on disk. If you must store files, encrypt them with a key derived from a user passphrase (using Argon2) and protect ciphertext with AEAD.
+- Document how to export/import keys securely and how to backup them (e.g., export encrypted PKCS#8 with Argon2-derived protection).
+
+Key lifecycle: onboarding, rotation, revocation
+- Onboarding:
+  - Each user has a keypair (X25519 or RSA 4096/2048); share public keys via a signed public-key manifest that other nodes can fetch from cloud folder (or via explicit out-of-band).
+  - Document trust model for public keys (manual trust, web-of-trust, or central trust anchor).
+- Rotation & revocation:
+  - To revoke a user: update a revocation manifest and re-wrap per-file keys for remaining users (or re-encrypt files if needed).
+  - Consider group keys/envelope keys to reduce re-wrapping cost: files encrypted with group key; group key is wrapped to members; rotate group key on membership change by re-wrapping group key.
+- Provide CLI/tools to re-wrap keys in bulk and a process in the wiki for emergency rotation.
+
+Sync, concurrency, and conflict model
+- Use fileId in metadata as canonical identity. Do not rely solely on filenames.
+- Each metadata update must increment version and update timestamp and lastAuthor.
+- Keep tombstones: when a file is deleted, create a small signed tombstone file (authenticated metadata) instead of simply deleting. Tombstones prevent resurrection on sync.
+- Conflict resolution:
+  - When two sides modify the same file concurrently, detect via version mismatch and create conflict copies:
+    - Example: <maskedName>.conflict.<timestamp>.<authorId>
+  - Do not auto-merge encrypted files.
+- Atomic write semantics:
+  - Write encrypted output to a temp file, then atomic rename to final masked filename.
+  - On startup, detect temp/partial files and ignore or reconcile.
+- Handle cloud provider temp artifacts:
+  - Many cloud clients create temporary files (e.g., partial upload names). Whitelist or ignore known patterns to avoid misinterpreting them as user files.
+
+Performance & large-file handling
+- For very large files, implement chunking:
+  - Chunk file into fixed-size blocks (e.g., 8–16 MiB), encrypt each chunk with AEAD using per-file key + chunk-specific nonce or counter.
+  - Store chunk metadata (chunk hashes) inside file metadata or separate sidecar manifest.
+  - Chunking enables resumable uploads and partial re-encryption but increases complexity.
+- For initial implementation, encrypt entire file per-file (no chunking) and add chunking later if needed.
+
+Implementation tasks for the junior developer (ordered, with acceptance criteria)
+Phase 0 — repo & tooling setup (quick)
+1. Convert project build to Gradle (Kotlin DSL) with wrapper, multi-module layout:
+   - Modules: core (crypto + file format), filewatcher, persistence, osintegration, cli.
+   - Configure Java toolchain to target Java 17.
+   - Add dependency catalog (libs.versions.toml) with versions for Tink/BouncyCastle, JUnit, Argon2 lib.
+   - CI: add GitHub Actions file to run Gradle build/test on Java 17.
+   Acceptance: repo builds with ./gradlew build, tests run.
+
+Phase 1 — cryptography core and format (critical)
+2. Implement new crypto core module (core):
+   - Add Google Tink dependency (preferred) or BouncyCastle if you want X25519.
+   - Implement APIs:
+     - generatePerFileKey(): returns random AES-256 key bytes.
+     - encryptFile(contentStream, perFileKey, recipients[], metadata): writes file using the versioned header format.
+     - decryptFile(fileStream, privateKey): reads header, unwrapps per-file key for this user, authenticates metadata, decrypts content to output.
+     - wrapKeyForRecipient(perFileKey, recipientPublicKey): returns wrappedKey bytes.
+     - unwrapKey(wrappedKey, privateKey): returns perFileKey.
+   - Use AEAD primitives; ensure nonce usage documented and random.
+   Acceptance: unit tests where:
+     - encryptFile → decryptFile (same user) yields original bytes.
+     - Tamper with ciphertext or metadata → decrypt fails with authenticated failure.
+
+3. Replace AesCrypto.scala with AEAD implementation:
+   - Remove PBKDF2-based AesCrypto; instead implement AEAD usage via Tink or BC.
+   - If passphrase support required later, implement Argon2 passphrase-to-key with salt storage in user metadata.
+   Acceptance: tests pass; no static IVs; no logging of secrets.
+
+Phase 2 — key handling & Windows keystore integration
+4. Implement key storage API in osintegration module:
+   - Windows: implement wrapper that uses DPAPI (via JNA) or Java SunMSCAPI keystore to store/retrieve private key blobs securely.
+   - Provide import/export commands for keys (always encrypt exports).
+   Acceptance: developer can store and retrieve keys and confirm private key not in plain files.
+
+5. Implement key-wrapping variants:
+   - X25519-based wrapping (preferred).
+   - RSA-OAEP fallback.
+   Acceptance: tests show multiple recipients can unwrap and decrypt; if using RSA fallback, show compatibility test.
+
+Phase 3 — filename masking, filewatcher, persistence, sync logic
+6. Implement filename masking strategy:
+   - Start with randomized masked names + original name in metadata (recommended).
+   - Implement helper functions for safe masked name generation (Base32/URL-safe, truncated).
+   Acceptance: list directory only shows masked names; when decrypting, originalName appears.
+
+7. Update FileWatcher module:
+   - Trigger encrypt on local plaintext additions/changes: read plaintext, encrypt via core.encryptFile, write to cloud folder as masked filename via atomic temp+rename.
+   - On detecting new encrypted files, attempt to decrypt (if user has permission) into local plaintext folder, or write to conflict/tombstone logic.
+   - Handle partial files / cloud-temp files (ignore patterns and temp-suffix handling).
+   Acceptance: manual test with a Dropbox-synced folder demonstrates roundtrip (write plaintext → encrypted appears in cloud dir → sync to other machine → decrypt to plaintext).
+
+8. Implement persistence manifest (optional but recommended):
+   - Local encrypted manifest (manifest DB/file) mapping fileId → local state, used for faster listing and recovery.
+   - Ensure manifest is AEAD-encrypted and synchronized with file headers (consistency checks).
+   Acceptance: manifest decrypts and matches actual files; used for recovery if masked names lost.
+
+Phase 4 — sync robustness, conflicts, tombstones, tests
+9. Implement tombstones and conflict handling:
+   - Create tombstone files for deletes, keep for a configurable retention period.
+   - On version mismatch, create conflict copies and log for user action.
+   Acceptance: concurrent edit test shows both sides create conflict copy and no data lost.
+
+10. Implement contentHash verification:
+    - Compute SHA-256 on plaintext, store in metadata, verify after decryption.
+    Acceptance: tampered content detected via hash mismatch.
+
+Phase 5 — documentation, tests, CI, packaging
+11. Update wiki and README with:
+    - Threat model, file format spec, metadata schema, filename masking policy, KDF / passphrase guidance, key storage & rotation instructions, sync behavior, and limitations (what is leaked).
+12. Add automated tests:
+    - Unit tests for crypto primitives and wrap/unwrap.
+    - Tamper tests (modify header, tamper ciphertext).
+    - Multi-recipient decrypt tests.
+    - Sync tests: simulated concurrent changes, deletes, tombstones.
+13. CI pipeline (GitHub Actions):
+    - Build on Java 17, run tests.
+    - Run OWASP dependency-check plugin.
+    - Run primitive static checks (SpotBugs/Detekt/Scalafix).
+    - Optional: run a job to check for secrets (secret-scan) in PRs.
+14. Packaging:
+    - Use Gradle org.beryx.runtime + jpackage to create Windows installer (optional).
+    - Provide simple CLI distribution (zip with java runtime or directions to install Java 17).
+
+Security & coding best practices (explicit rules to follow)
+- Never log keys, secrets, or plaintext. Audit all log statements.
+- Use SecureRandom for keys and nonces.
+- Zero sensitive byte arrays when finished if possible.
+- Use AEAD for both content and metadata. Verify auth failures and refuse to continue on tamper.
+- Use clear exception handling — bubble up meaningful messages without secrets.
+- Avoid global static private keys; load keys on demand from OS keystore.
+- Parameterize Argon2/PBKDF2 and store parameters with salts.
+- Use versioned file header so future changes are possible without breaking old files.
+- Document exactly what is and is not protected (sizes, timestamps, masked names, directory structure).
+
+Dependency & library guidance (starter list)
+- Google Tink (Java): primary crypto library for safe-by-default AEAD and hybrid.
+- Bouncy Castle (latest): for direct access to X25519 / XChaCha20 if needed.
+- Argon2 Java binding (e.g., phc-winner-argon2 via BouncyCastle or com.kosprov:argon2-jvm), or use Tink-derived KDF if supported.
+- JNA (for DPAPI) or use Java SunMSCAPI provider for Windows keystore access.
+- Gradle plugins: org.beryx.runtime, com.github.johnrengelman.shadow, org.owasp.dependencycheck, checkstyle/spotbugs.
+- Testing: JUnit 5, ScalaTest.
+
+CI/Build environment (concrete)
+- Java toolchain: Java 17 (set via Gradle toolchain to guarantee reproducible builds).
+- Gradle wrapper committed to repo: use a recent 8.x.
+- GitHub Actions workflow:
+  - on: push, pull_request
+  - jobs:
+    - build: runs ./gradlew clean build on matrix os: ubuntu-latest, windows-latest (Windows is important for OS-integration tests).
+    - dependency-check: ./gradlew dependencyCheckAnalyze
+    - test: run unit & integration tests (including tamper tests)
+    - optional: publish artifacts (nightly build) when tests pass
+- Secrets in CI (if needed): store keys only if absolutely required (prefer not to); use ephemeral service accounts if necessary.
+
+Documentation tasks (what the junior dev must add)
+- Add wiki pages:
+  - Threat model & guarantees
+  - File format specification (binary header, metadata schema)
+  - Key lifecycle (onboarding, rotation, revocation)
+  - Filename masking policy & Windows specifics
+  - Build & dev guide (Gradle, Java toolchain, how to run tests)
+  - Operational guide (how to export/import keys safely, how to recover from conflicts)
+- Add inline comments in crypto code referencing the chosen standards (RFCs, Tink docs, NIST/AES-GCM guidelines).
+
+Testing checklist (to create and include)
+- Crypto unit tests:
+  - Roundtrip encrypt/decrypt for one recipient.
+  - Multi-recipient unwrap & decrypt.
+  - Tamper metadata → decryption fails.
+  - Tamper ciphertext → decryption fails.
+- Sync tests:
+  - Two-way sync simulation with conflicts.
+  - Tombstone behavior test.
+  - Temp file detection & ignore patterns.
+- Performance tests:
+  - Encryption/decryption throughput for files up to expected max size.
+- Security tests:
+  - Fuzzing of header parser.
+  - Secret-scan to ensure no private keys in repo.
+
+Estimated priorities and rough timeline (example)
+- Day 0–2: Set up Gradle wrapper, modules, CI skeleton, and basic README updates.
+- Day 3–10: Implement core AEAD API, header format, and unit tests for roundtrip/tamper.
+- Day 11–18: Implement key wrapping (X25519 or RSA fallback), osintegration for key storage on Windows, and tests for multi-recipient flows.
+- Day 19–26: Integrate with FileWatcher, implement atomic write, masked filename strategy, and basic two-way sync handling.
+- Day 27–35: Add conflict/tombstone handling, manifest persistence, and more robust integration tests. Update wiki and docs.
+- Ongoing: Security review, dependency updates, packaging.
+
+Notes & tradeoffs to document for reviewers
+- Tink simplifies safe usage but may hide some low-level controls. Bouncy Castle gives more control (X25519/XChaCha) but requires more careful coding.
+- Using randomized filenames protects privacy but requires metadata reads for listing; deterministic HMAC is simpler but leaks equality.
+- Argon2 vs PBKDF2: Argon2 is preferred; PBKDF2 is acceptable fallback if Argon2 binding is problematic.
+- Chunking large files adds complexity; add only if needed.
+
+Next actions
+- Confirm Java version (17 or 21). I recommend Java 17 LTS.
+- Confirm crypto library preference: Google Tink (recommended) or Bouncy Castle for X25519.
+- To be able to specify:
+  - (A) Ready-to-paste Gradle build.gradle.kts + settings.gradle.kts skeleton for the multi-module layout with recommended plugins.
+  - (B) A secure Scala/Java AEAD example (AES-GCM via Tink or BC) showing encryptFile/decryptFile and the header format.
+  - (C) A Windows DPAPI example wrapper (JNA) to protect private key blobs.
